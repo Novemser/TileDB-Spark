@@ -3,25 +3,28 @@ package io.tiledb.spark;
 import static io.tiledb.spark.util.addEpsilon;
 import static io.tiledb.spark.util.generateAllSubarrays;
 import static io.tiledb.spark.util.subtractEpsilon;
-import static org.apache.log4j.Priority.ERROR;
 import static org.apache.spark.metrics.TileDBMetricsSource.dataSourceBuildRangeFromFilterTimerName;
 import static org.apache.spark.metrics.TileDBMetricsSource.dataSourceCheckAndMergeRangesTimerName;
 import static org.apache.spark.metrics.TileDBMetricsSource.dataSourceComputeNeededSplitsToReduceToMedianVolumeTimerName;
 import static org.apache.spark.metrics.TileDBMetricsSource.dataSourcePlanBatchInputPartitionsTimerName;
-import static org.apache.spark.metrics.TileDBMetricsSource.dataSourcePruneColumnsTimerName;
-import static org.apache.spark.metrics.TileDBMetricsSource.dataSourcePushFiltersTimerName;
-import static org.apache.spark.metrics.TileDBMetricsSource.dataSourceReadSchemaTimerName;
 
-import io.tiledb.java.api.*;
-import java.net.URI;
+import io.tiledb.java.api.Array;
+import io.tiledb.java.api.Context;
+import io.tiledb.java.api.Domain;
+import io.tiledb.java.api.Pair;
+import io.tiledb.java.api.TileDBError;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.IntStream;
-import org.apache.log4j.Logger;
+
 import org.apache.spark.TaskContext;
 import org.apache.spark.metrics.TileDBReadMetricsUpdater;
+import org.apache.spark.sql.connector.read.Batch;
+import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.sources.And;
 import org.apache.spark.sql.sources.EqualNullSafe;
 import org.apache.spark.sql.sources.EqualTo;
@@ -32,117 +35,30 @@ import org.apache.spark.sql.sources.In;
 import org.apache.spark.sql.sources.LessThan;
 import org.apache.spark.sql.sources.LessThanOrEqual;
 import org.apache.spark.sql.sources.Or;
-import org.apache.spark.sql.sources.v2.reader.*;
-import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.vectorized.ColumnarBatch;
 
-public class TileDBDataSourceReader
-    implements DataSourceReader,
-        SupportsPushDownRequiredColumns,
-        SupportsScanColumnarBatch,
-        SupportsPushDownFilters {
-
-  static Logger log = Logger.getLogger(TileDBDataSourceReader.class.getName());
+public class TileDBBatch implements Batch {
+  private final TileDBReadSchema tileDBReadSchema;
+  private final Map<String, String> properties;
+  private final TileDBDataSourceOptions tileDBDataSourceOptions;
   private final TileDBReadMetricsUpdater metricsUpdater;
 
-  private URI uri;
-  private TileDBReadSchema tileDBReadSchema;
-  private TileDBDataSourceOptions tiledbOptions;
-  private Filter[] pushedFilters;
-
-  public TileDBDataSourceReader(URI uri, TileDBDataSourceOptions options) {
-    this.uri = uri;
-    this.tiledbOptions = options;
-    this.tileDBReadSchema = new TileDBReadSchema(uri, options);
+  public TileDBBatch(TileDBReadSchema tileDBReadSchema, Map<String, String> properties, TileDBDataSourceOptions options)
+  {
+    this.tileDBReadSchema = tileDBReadSchema;
+    this.properties = properties;
+    this.tileDBDataSourceOptions = options;
     this.metricsUpdater = new TileDBReadMetricsUpdater(TaskContext.get());
   }
 
   @Override
-  public StructType readSchema() {
-    metricsUpdater.startTimer(dataSourceReadSchemaTimerName);
-    log.trace("Reading schema for " + uri);
-    StructType schema = tileDBReadSchema.getSparkSchema();
-    log.trace("Read schema for " + uri + ": " + schema);
-    metricsUpdater.finish(dataSourceReadSchemaTimerName);
-    return schema;
-  }
-
-  @Override
-  public void pruneColumns(StructType pushDownSchema) {
-    metricsUpdater.startTimer(dataSourcePruneColumnsTimerName);
-    log.trace("Set pushdown columns for " + uri + ": " + pushDownSchema);
-    tileDBReadSchema.setPushDownSchema(pushDownSchema);
-    metricsUpdater.finish(dataSourcePruneColumnsTimerName);
-  }
-
-  @Override
-  public Filter[] pushFilters(Filter[] filters) {
-    metricsUpdater.startTimer(dataSourcePushFiltersTimerName);
-    log.trace("size of filters " + filters.length);
-    ArrayList<Filter> pushedFiltersList = new ArrayList<>();
-    ArrayList<Filter> leftOverFilters = new ArrayList<>();
-
-    // Loop through all filters and check if they are support type and on a domain. If so push them
-    // down
-    for (Filter filter : filters) {
-      if (filterCanBePushedDown(filter)) {
-        pushedFiltersList.add(filter);
-      } else {
-        leftOverFilters.add(filter);
-      }
-    }
-
-    this.pushedFilters = new Filter[pushedFiltersList.size()];
-    this.pushedFilters = pushedFiltersList.toArray(this.pushedFilters);
-
-    Filter[] leftOvers = new Filter[leftOverFilters.size()];
-    leftOvers = leftOverFilters.toArray(leftOvers);
-    metricsUpdater.finish(dataSourcePushFiltersTimerName);
-    return leftOvers;
-  }
-
-  private boolean filterCanBePushedDown(Filter filter) {
-    if (filter instanceof And) {
-      And f = (And) filter;
-      if (filterCanBePushedDown(f.left()) && filterCanBePushedDown(f.right())) {
-        return true;
-      }
-    } else if (filter instanceof EqualNullSafe) {
-      return true;
-    } else if (filter instanceof EqualTo) {
-      return true;
-    } else if (filter instanceof GreaterThan) {
-      return true;
-    } else if (filter instanceof GreaterThanOrEqual) {
-      return true;
-    } else if (filter instanceof LessThan) {
-      return true;
-    } else if (filter instanceof LessThanOrEqual) {
-      return true;
-    }
-    return false;
-  }
-
-  @Override
-  public Filter[] pushedFilters() {
-    return pushedFilters;
-  }
-
-  @Override
-  public boolean enableBatchRead() {
-    // always read in batch mode
-    return true;
-  }
-
-  @Override
-  public List<InputPartition<ColumnarBatch>> planBatchInputPartitions() {
+  public InputPartition[] planInputPartitions() {
     metricsUpdater.startTimer(dataSourcePlanBatchInputPartitionsTimerName);
-    ArrayList<InputPartition<ColumnarBatch>> readerPartitions = new ArrayList<>();
+    ArrayList<InputPartition> readerPartitions = new ArrayList<>();
 
     try {
-      Context ctx = new Context(tiledbOptions.getTileDBConfigMap(true));
+      Context ctx = new Context(tileDBDataSourceOptions.getTileDBConfigMap(true));
       // Fetch the array and load its metadata
-      Array array = new Array(ctx, uri.toString());
+      Array array = new Array(ctx, util.tryGetArrayURI(tileDBDataSourceOptions).toString());
       HashMap<String, Pair> nonEmptyDomain = array.nonEmptyDomain();
       Domain domain = array.getSchema().getDomain();
 
@@ -186,7 +102,7 @@ public class TileDBDataSourceReader
       generateAllSubarrays(
           ranges.subList(0, (int) (domain.getNDim())), subarrays, 0, new ArrayList<>());
 
-      int availablePartitions = tiledbOptions.getPartitionCount();
+      int availablePartitions = tileDBDataSourceOptions.getPartitionCount();
       if (availablePartitions > 1) {
         // Base case where we don't have any (or just single) pushdown per dimension
         if (subarrays.size() == 1 && subarrays.get(0).splittable()) {
@@ -257,49 +173,220 @@ public class TileDBDataSourceReader
         List<List<Range>> subarrayRanges = new ArrayList<>();
         subarrayRanges.add(subarray.getRanges());
         readerPartitions.add(
-            new TileDBDataReaderPartition(
-                uri, tileDBReadSchema, tiledbOptions, subarrayRanges, attributeRanges));
+                new TileDBDataInputPartition(
+                        util.tryGetArrayURI(tileDBDataSourceOptions), tileDBReadSchema, tileDBDataSourceOptions, subarrayRanges, attributeRanges));
       }
-
-    } catch (TileDBError tileDBError) {
-      log.log(ERROR, tileDBError.getMessage());
       metricsUpdater.finish(dataSourcePlanBatchInputPartitionsTimerName);
-      return readerPartitions;
+      InputPartition[] partitionsArray = new InputPartition[readerPartitions.size()];
+      partitionsArray = readerPartitions.toArray(partitionsArray);
+      return partitionsArray;
+    } catch (TileDBError tileDBError) {
+//      log.log(ERROR, tileDBError.getMessage()); TODO
+      metricsUpdater.finish(dataSourcePlanBatchInputPartitionsTimerName);
     }
-    metricsUpdater.finish(dataSourcePlanBatchInputPartitionsTimerName);
-    return readerPartitions;
+    return null;
   }
 
   /**
-   * Computes the number of splits needed to reduce a subarray to a given size
+   * Creates range(s) from a filter that has been pushed down
    *
-   * @param subArrayRanges
-   * @param medianVolume
+   * @param filter
+   * @param nonEmptyDomain
+   * @throws TileDBError
+   */
+  private Pair<List<List<Range>>, Class> buildRangeFromFilter(
+          Filter filter, HashMap<String, Pair> nonEmptyDomain) throws TileDBError {
+    metricsUpdater.startTimer(dataSourceBuildRangeFromFilterTimerName);
+    Class filterType = filter.getClass();
+    // Map<String, Integer> dimensionIndexing = new HashMap<>();
+    List<List<Range>> ranges = new ArrayList<>();
+    // Build mapping for dimension name to index
+    for (int i = 0; i < this.tileDBReadSchema.dimensionIndex.size(); i++) {
+      ranges.add(new ArrayList<>());
+    }
+
+    for (int i = 0; i < this.tileDBReadSchema.attributeIndex.size(); i++) {
+      ranges.add(new ArrayList<>());
+    }
+    // First handle filter that are AND this is something like dim1 >= 1 AND dim1 <= 10
+    // Could also be dim1 between 1 and 10
+    if (filter instanceof And) {
+      Pair<List<List<Range>>, Class> left =
+              buildRangeFromFilter(((And) filter).left(), nonEmptyDomain);
+      Pair<List<List<Range>>, Class> right =
+              buildRangeFromFilter(((And) filter).right(), nonEmptyDomain);
+
+      int dimIndex =
+              IntStream.range(0, left.getFirst().size())
+                      .filter(e -> left.getFirst().get(e).size() > 0)
+                      .findFirst()
+                      .getAsInt();
+
+      // Create return constructed ranges
+      List<List<Range>> constructedRanges = new ArrayList<>();
+      for (int i = 0; i < Math.max(left.getFirst().size(), right.getFirst().size()); i++)
+        constructedRanges.add(new ArrayList<>());
+
+      // Switch on the left side to see if it is the greater than or less than clause and set
+      // appropriate position
+      Pair<Object, Object> newPair = new Pair<>(null, null);
+      if (left.getSecond() == GreaterThan.class || left.getSecond() == GreaterThanOrEqual.class) {
+        newPair.setFirst(left.getFirst().get(dimIndex).get(0).getFirst());
+      } else if (left.getSecond() == LessThan.class || left.getSecond() == LessThanOrEqual.class) {
+        newPair.setSecond(left.getFirst().get(dimIndex).get(0).getSecond());
+      }
+
+      // Next switch on the right side to see if it is the greater than or less than clause and set
+      // appropriate position
+      if (right.getSecond() == GreaterThan.class || right.getSecond() == GreaterThanOrEqual.class) {
+        newPair.setFirst(right.getFirst().get(dimIndex).get(0).getFirst());
+      } else if (right.getSecond() == LessThan.class
+              || right.getSecond() == LessThanOrEqual.class) {
+        newPair.setSecond(right.getFirst().get(dimIndex).get(0).getSecond());
+      }
+
+      // Set the range
+      List<Range> constructedRange = new ArrayList<Range>();
+      constructedRange.add(new Range(newPair));
+
+      constructedRanges.set(dimIndex, constructedRange);
+
+      return new Pair<>(constructedRanges, filterType);
+      // Handle Or clauses as recursive calls
+    } else if (filter instanceof Or) {
+      Pair<List<List<Range>>, Class> left =
+              buildRangeFromFilter(((Or) filter).left(), nonEmptyDomain);
+      Pair<List<List<Range>>, Class> right =
+              buildRangeFromFilter(((Or) filter).right(), nonEmptyDomain);
+      for (int i = 0; i < left.getFirst().size(); i++) {
+        while (right.getFirst().size() < i) {
+          right.getFirst().add(new ArrayList<>());
+        }
+
+        right.getFirst().get(i).addAll(left.getFirst().get(i));
+      }
+
+      return right;
+      // Equal and EqualNullSafe are just straight dim1 = 1 fields. Set both side of range to single
+      // value
+    } else if (filter instanceof EqualNullSafe) {
+      EqualNullSafe f = (EqualNullSafe) filter;
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), f.value())));
+    } else if (filter instanceof EqualTo) {
+      EqualTo f = (EqualTo) filter;
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), f.value())));
+
+      // GreaterThan is ranges which are in the form of `dim > 1`
+    } else if (filter instanceof GreaterThan) {
+      GreaterThan f = (GreaterThan) filter;
+      Object second;
+      if (nonEmptyDomain.get(f.attribute()) != null)
+        second = nonEmptyDomain.get(f.attribute()).getSecond();
+      else second = getMaxValue(f.value().getClass());
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges
+              .get(columnIndex)
+              .add(
+                      new Range(
+                              new Pair<>(
+                                      addEpsilon(
+                                              (Number) f.value(), this.tileDBReadSchema.columnTypes.get(columnIndex)),
+                                      second)));
+    } else if (filter instanceof GreaterThanOrEqual) {
+      GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
+      Object second;
+      if (nonEmptyDomain.get(f.attribute()) != null)
+        second = nonEmptyDomain.get(f.attribute()).getSecond();
+      else second = getMaxValue(f.value().getClass());
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), second)));
+
+      // For in filters we will add every value as ranges of 1. `dim IN (1, 2, 3)`
+    } else if (filter instanceof In) {
+      In f = (In) filter;
+      // Add every value as a new range, TileDB will collapse into super ranges for us
+      for (Object value : f.values()) {
+        int dimIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+        ranges.get(dimIndex).add(new Range(new Pair<>(value, value)));
+      }
+
+      // LessThan is ranges which are in the form of `dim < 1`
+    } else if (filter instanceof LessThan) {
+      LessThan f = (LessThan) filter;
+      Object first;
+      if (nonEmptyDomain.get(f.attribute()) != null)
+        first = nonEmptyDomain.get(f.attribute()).getSecond();
+      else first = getMinValue(f.value().getClass());
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges
+              .get(columnIndex)
+              .add(
+                      new Range(
+                              new Pair<>(
+                                      first,
+                                      subtractEpsilon(
+                                              (Number) f.value(),
+                                              this.tileDBReadSchema.columnTypes.get(columnIndex)))));
+      // LessThanOrEqual is ranges which are in the form of `dim <= 1`
+    } else if (filter instanceof LessThanOrEqual) {
+      LessThanOrEqual f = (LessThanOrEqual) filter;
+      Object first;
+      if (nonEmptyDomain.get(f.attribute()) != null)
+        first = nonEmptyDomain.get(f.attribute()).getSecond();
+      else first = getMinValue(f.value().getClass());
+      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
+      ranges.get(columnIndex).add(new Range(new Pair<>(first, f.value())));
+    } else {
+      throw new TileDBError("Unsupported filter type");
+    }
+    metricsUpdater.finish(dataSourceBuildRangeFromFilterTimerName);
+    return new Pair<>(ranges, filterType);
+  }
+
+  /**
+   * Returns the minimum value for the given datatype
+   *
    * @param datatype
    * @return
    */
-  private List<Integer> computeNeededSplitsToReduceToMedianVolume(
-      List<SubArrayRanges> subArrayRanges, Number medianVolume, Class datatype) {
-    metricsUpdater.startTimer(dataSourceComputeNeededSplitsToReduceToMedianVolumeTimerName);
-    List<Integer> neededSplits = new ArrayList<>();
-    for (SubArrayRanges subArrayRange : subArrayRanges) {
-      Number volume = subArrayRange.getVolume();
-      if (datatype == Byte.class) {
-        neededSplits.add(volume.byteValue() / medianVolume.byteValue());
-      } else if (datatype == Short.class) {
-        neededSplits.add(volume.shortValue() / medianVolume.shortValue());
-      } else if (datatype == Integer.class) {
-        neededSplits.add(volume.intValue() / medianVolume.intValue());
-      } else if (datatype == Long.class) {
-        neededSplits.add(((Long) (volume.longValue() / medianVolume.longValue())).intValue());
-      } else if (datatype == Float.class) {
-        neededSplits.add(((Float) (volume.floatValue() / medianVolume.floatValue())).intValue());
-      } else if (datatype == Double.class) {
-        neededSplits.add(((Double) (volume.doubleValue() / medianVolume.doubleValue())).intValue());
-      }
+  private Object getMinValue(Class datatype) {
+    if (datatype == Byte.class) {
+      return Byte.MIN_VALUE;
+    } else if (datatype == Short.class) {
+      return Short.MIN_VALUE;
+    } else if (datatype == Integer.class) {
+      return Integer.MIN_VALUE;
+    } else if (datatype == Long.class) {
+      return Long.MIN_VALUE;
+    } else if (datatype == Float.class) {
+      return Float.MIN_VALUE;
+    } else {
+      return null;
     }
-    metricsUpdater.finish(dataSourceComputeNeededSplitsToReduceToMedianVolumeTimerName);
-    return neededSplits;
+  }
+
+  /**
+   * Returns the maximum value for the given datatype
+   *
+   * @param datatype
+   * @return
+   */
+  private Object getMaxValue(Class datatype) {
+    if (datatype == Byte.class) {
+      return Byte.MAX_VALUE;
+    } else if (datatype == Short.class) {
+      return Short.MAX_VALUE;
+    } else if (datatype == Integer.class) {
+      return Integer.MAX_VALUE;
+    } else if (datatype == Long.class) {
+      return Long.MAX_VALUE;
+    } else if (datatype == Float.class) {
+      return Float.MAX_VALUE;
+    } else {
+      return null;
+    }
   }
 
   /**
@@ -355,204 +442,40 @@ public class TileDBDataSourceReader
   }
 
   /**
-   * Returns the minimum value for the given datatype
+   * Computes the number of splits needed to reduce a subarray to a given size
    *
+   * @param subArrayRanges
+   * @param medianVolume
    * @param datatype
    * @return
    */
-  private Object getMinValue(Class datatype) {
-    if (datatype == Byte.class) {
-      return Byte.MIN_VALUE;
-    } else if (datatype == Short.class) {
-      return Short.MIN_VALUE;
-    } else if (datatype == Integer.class) {
-      return Integer.MIN_VALUE;
-    } else if (datatype == Long.class) {
-      return Long.MIN_VALUE;
-    } else if (datatype == Float.class) {
-      return Float.MIN_VALUE;
-    } else {
-      return null;
+  private List<Integer> computeNeededSplitsToReduceToMedianVolume(
+          List<SubArrayRanges> subArrayRanges, Number medianVolume, Class datatype) {
+    metricsUpdater.startTimer(dataSourceComputeNeededSplitsToReduceToMedianVolumeTimerName);
+    List<Integer> neededSplits = new ArrayList<>();
+    for (SubArrayRanges subArrayRange : subArrayRanges) {
+      Number volume = subArrayRange.getVolume();
+      if (datatype == Byte.class) {
+        neededSplits.add(volume.byteValue() / medianVolume.byteValue());
+      } else if (datatype == Short.class) {
+        neededSplits.add(volume.shortValue() / medianVolume.shortValue());
+      } else if (datatype == Integer.class) {
+        neededSplits.add(volume.intValue() / medianVolume.intValue());
+      } else if (datatype == Long.class) {
+        neededSplits.add(((Long) (volume.longValue() / medianVolume.longValue())).intValue());
+      } else if (datatype == Float.class) {
+        neededSplits.add(((Float) (volume.floatValue() / medianVolume.floatValue())).intValue());
+      } else if (datatype == Double.class) {
+        neededSplits.add(((Double) (volume.doubleValue() / medianVolume.doubleValue())).intValue());
+      }
     }
+    metricsUpdater.finish(dataSourceComputeNeededSplitsToReduceToMedianVolumeTimerName);
+    return neededSplits;
   }
 
-  /**
-   * Returns the maximum value for the given datatype
-   *
-   * @param datatype
-   * @return
-   */
-  private Object getMaxValue(Class datatype) {
-    if (datatype == Byte.class) {
-      return Byte.MAX_VALUE;
-    } else if (datatype == Short.class) {
-      return Short.MAX_VALUE;
-    } else if (datatype == Integer.class) {
-      return Integer.MAX_VALUE;
-    } else if (datatype == Long.class) {
-      return Long.MAX_VALUE;
-    } else if (datatype == Float.class) {
-      return Float.MAX_VALUE;
-    } else {
-      return null;
-    }
-  }
 
-  /**
-   * Creates range(s) from a filter that has been pushed down
-   *
-   * @param filter
-   * @param nonEmptyDomain
-   * @throws TileDBError
-   */
-  private Pair<List<List<Range>>, Class> buildRangeFromFilter(
-      Filter filter, HashMap<String, Pair> nonEmptyDomain) throws TileDBError {
-    metricsUpdater.startTimer(dataSourceBuildRangeFromFilterTimerName);
-    Class filterType = filter.getClass();
-    // Map<String, Integer> dimensionIndexing = new HashMap<>();
-    List<List<Range>> ranges = new ArrayList<>();
-    // Build mapping for dimension name to index
-    for (int i = 0; i < this.tileDBReadSchema.dimensionIndex.size(); i++) {
-      ranges.add(new ArrayList<>());
-    }
-
-    for (int i = 0; i < this.tileDBReadSchema.attributeIndex.size(); i++) {
-      ranges.add(new ArrayList<>());
-    }
-    // First handle filter that are AND this is something like dim1 >= 1 AND dim1 <= 10
-    // Could also be dim1 between 1 and 10
-    if (filter instanceof And) {
-      Pair<List<List<Range>>, Class> left =
-          buildRangeFromFilter(((And) filter).left(), nonEmptyDomain);
-      Pair<List<List<Range>>, Class> right =
-          buildRangeFromFilter(((And) filter).right(), nonEmptyDomain);
-
-      int dimIndex =
-          IntStream.range(0, left.getFirst().size())
-              .filter(e -> left.getFirst().get(e).size() > 0)
-              .findFirst()
-              .getAsInt();
-
-      // Create return constructed ranges
-      List<List<Range>> constructedRanges = new ArrayList<>();
-      for (int i = 0; i < Math.max(left.getFirst().size(), right.getFirst().size()); i++)
-        constructedRanges.add(new ArrayList<>());
-
-      // Switch on the left side to see if it is the greater than or less than clause and set
-      // appropriate position
-      Pair<Object, Object> newPair = new Pair<>(null, null);
-      if (left.getSecond() == GreaterThan.class || left.getSecond() == GreaterThanOrEqual.class) {
-        newPair.setFirst(left.getFirst().get(dimIndex).get(0).getFirst());
-      } else if (left.getSecond() == LessThan.class || left.getSecond() == LessThanOrEqual.class) {
-        newPair.setSecond(left.getFirst().get(dimIndex).get(0).getSecond());
-      }
-
-      // Next switch on the right side to see if it is the greater than or less than clause and set
-      // appropriate position
-      if (right.getSecond() == GreaterThan.class || right.getSecond() == GreaterThanOrEqual.class) {
-        newPair.setFirst(right.getFirst().get(dimIndex).get(0).getFirst());
-      } else if (right.getSecond() == LessThan.class
-          || right.getSecond() == LessThanOrEqual.class) {
-        newPair.setSecond(right.getFirst().get(dimIndex).get(0).getSecond());
-      }
-
-      // Set the range
-      List<Range> constructedRange = new ArrayList<Range>();
-      constructedRange.add(new Range(newPair));
-
-      constructedRanges.set(dimIndex, constructedRange);
-
-      return new Pair<>(constructedRanges, filterType);
-      // Handle Or clauses as recursive calls
-    } else if (filter instanceof Or) {
-      Pair<List<List<Range>>, Class> left =
-          buildRangeFromFilter(((Or) filter).left(), nonEmptyDomain);
-      Pair<List<List<Range>>, Class> right =
-          buildRangeFromFilter(((Or) filter).right(), nonEmptyDomain);
-      for (int i = 0; i < left.getFirst().size(); i++) {
-        while (right.getFirst().size() < i) {
-          right.getFirst().add(new ArrayList<>());
-        }
-
-        right.getFirst().get(i).addAll(left.getFirst().get(i));
-      }
-
-      return right;
-      // Equal and EqualNullSafe are just straight dim1 = 1 fields. Set both side of range to single
-      // value
-    } else if (filter instanceof EqualNullSafe) {
-      EqualNullSafe f = (EqualNullSafe) filter;
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), f.value())));
-    } else if (filter instanceof EqualTo) {
-      EqualTo f = (EqualTo) filter;
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), f.value())));
-
-      // GreaterThan is ranges which are in the form of `dim > 1`
-    } else if (filter instanceof GreaterThan) {
-      GreaterThan f = (GreaterThan) filter;
-      Object second;
-      if (nonEmptyDomain.get(f.attribute()) != null)
-        second = nonEmptyDomain.get(f.attribute()).getSecond();
-      else second = getMaxValue(f.value().getClass());
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges
-          .get(columnIndex)
-          .add(
-              new Range(
-                  new Pair<>(
-                      addEpsilon(
-                          (Number) f.value(), this.tileDBReadSchema.columnTypes.get(columnIndex)),
-                      second)));
-    } else if (filter instanceof GreaterThanOrEqual) {
-      GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
-      Object second;
-      if (nonEmptyDomain.get(f.attribute()) != null)
-        second = nonEmptyDomain.get(f.attribute()).getSecond();
-      else second = getMaxValue(f.value().getClass());
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges.get(columnIndex).add(new Range(new Pair<>(f.value(), second)));
-
-      // For in filters we will add every value as ranges of 1. `dim IN (1, 2, 3)`
-    } else if (filter instanceof In) {
-      In f = (In) filter;
-      // Add every value as a new range, TileDB will collapse into super ranges for us
-      for (Object value : f.values()) {
-        int dimIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-        ranges.get(dimIndex).add(new Range(new Pair<>(value, value)));
-      }
-
-      // LessThan is ranges which are in the form of `dim < 1`
-    } else if (filter instanceof LessThan) {
-      LessThan f = (LessThan) filter;
-      Object first;
-      if (nonEmptyDomain.get(f.attribute()) != null)
-        first = nonEmptyDomain.get(f.attribute()).getSecond();
-      else first = getMinValue(f.value().getClass());
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges
-          .get(columnIndex)
-          .add(
-              new Range(
-                  new Pair<>(
-                      first,
-                      subtractEpsilon(
-                          (Number) f.value(),
-                          this.tileDBReadSchema.columnTypes.get(columnIndex)))));
-      // LessThanOrEqual is ranges which are in the form of `dim <= 1`
-    } else if (filter instanceof LessThanOrEqual) {
-      LessThanOrEqual f = (LessThanOrEqual) filter;
-      Object first;
-      if (nonEmptyDomain.get(f.attribute()) != null)
-        first = nonEmptyDomain.get(f.attribute()).getSecond();
-      else first = getMinValue(f.value().getClass());
-      int columnIndex = this.tileDBReadSchema.getColumnId(f.attribute()).get();
-      ranges.get(columnIndex).add(new Range(new Pair<>(first, f.value())));
-    } else {
-      throw new TileDBError("Unsupported filter type");
-    }
-    metricsUpdater.finish(dataSourceBuildRangeFromFilterTimerName);
-    return new Pair<>(ranges, filterType);
+  @Override
+  public PartitionReaderFactory createReaderFactory() {
+    return null;
   }
 }

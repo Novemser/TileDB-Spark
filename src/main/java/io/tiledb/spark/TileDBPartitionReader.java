@@ -49,6 +49,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.log4j.Logger;
 import org.apache.spark.TaskContext;
 import org.apache.spark.metrics.TileDBReadMetricsUpdater;
+import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.execution.arrow.ArrowUtils;
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.sources.v2.reader.InputPartitionReader;
@@ -58,9 +59,10 @@ import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import oshi.hardware.HardwareAbstractionLayer;
 
-public class TileDBDataReaderPartitionScan implements InputPartitionReader<ColumnarBatch> {
+public class TileDBPartitionReader implements PartitionReader<ColumnarBatch>
+{
 
-  static Logger log = Logger.getLogger(TileDBDataReaderPartitionScan.class.getName());
+  static Logger log = Logger.getLogger(TileDBPartitionReader.class.getName());
 
   // Filter pushdown to this partition
   private final List<List<Range>> allRanges;
@@ -256,7 +258,7 @@ public class TileDBDataReaderPartitionScan implements InputPartitionReader<Colum
     }
   }
 
-  public TileDBDataReaderPartitionScan(
+  public TileDBPartitionReader(
       URI uri,
       TileDBReadSchema schema,
       TileDBDataSourceOptions options,
